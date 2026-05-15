@@ -1,222 +1,459 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { createClient } from '@supabase/supabase-js';
 import { ConfigService } from '@nestjs/config';
 @Injectable()
 export class AttendanceService {
-    constructor(private configService: ConfigService) { }
-    private supabase = createClient(this.configService.get<string>('SUPABASE_URL'), this.configService.get<string>('SUPABASE_KEY'));
+  private readonly logger = new Logger(AttendanceService.name);
 
-    async getAllAttendance(orgId: any): Promise<any> {
-        // Fetch data from the first table
-        const { data: table1Data, error: table1Error } = await this.supabase
-            .from('time')
-            .select('*').order('id', { ascending: false }).eq('org_id', orgId);
-        if (table1Error) {
-            throw table1Error;
-        }
-        console.log(table1Data);
+  constructor(private configService: ConfigService) {}
+  private supabase = createClient(
+    this.configService.get<string>('SUPABASE_URL'),
+    this.configService.get<string>('SUPABASE_KEY'),
+  );
 
-        // Fetch data from the second table
-        const { data: table2Data, error: table2Error } = await this.supabase
-            .from('add_member')
-            .select('*').order('id', { ascending: false });
+  private async resolveOrganizationIds(inputId: any): Promise<string[]> {
+    const requestedId = String(inputId);
+    const { data, error } = await this.supabase
+      .from('organization_profile')
+      .select('id,user_id')
+      .eq('user_id', requestedId)
+      .maybeSingle();
 
-        if (table2Error) {
-            throw table2Error;
-        }
+    if (error) {
+      this.logger.error(
+        `Failed to resolve organization id for userId=${requestedId}`,
+        error.message,
+      );
+      throw error;
+    }
 
-        // Join the data based on the common ID
-        const joinedData = [];
-        table1Data.forEach((item1) => {
-            const obj = table2Data.find(item2 => item2.user_id === item1.user_Id);
-            if (obj) {
-                joinedData.push({
-                    ...obj,
-                    ...item1,
-                });
-            }
-        }
+    if (!data?.id) {
+      this.logger.warn(
+        `No organization_profile found for userId=${requestedId}; using incoming id as org_id`,
+      );
+      return [requestedId];
+    }
+
+    this.logger.log(
+      `Resolved userId=${requestedId} to organization_profile.id=${data.id}`,
+    );
+    return [...new Set([String(data.id), requestedId])];
+  }
+
+  private logRecentTimeRowsForDebug(rows: any[], context: string) {
+    const sample = rows.slice(0, 5).map((row) => ({
+      id: row.id,
+      org_id: row.org_id,
+      user_Id: row.user_Id,
+      date: row.date,
+      created_at: row.created_at,
+      keys: Object.keys(row),
+    }));
+
+    this.logger.warn(
+      `${context}: recent time row sample=${JSON.stringify(sample)}`,
+    );
+  }
+
+  private async logTimeRowsWhenEmpty(context: string) {
+    const { data, error } = await this.supabase
+      .from('time')
+      .select('*')
+      .order('id', { ascending: false })
+      .limit(5);
+
+    if (error) {
+      this.logger.error(
+        `${context}: failed to fetch recent time rows`,
+        error.message,
+      );
+      return;
+    }
+
+    this.logRecentTimeRowsForDebug(data ?? [], context);
+  }
+
+  async getAllAttendance(orgId: any): Promise<any> {
+    await this.resolveOrganizationIds(orgId);
+    this.logger.log(
+      `getAllAttendance started inputId=${orgId}; filtering time.org_id=${orgId}`,
+    );
+
+    // Fetch data from the first table
+    const { data: table1Data, error: table1Error } = await this.supabase
+      .from('time')
+      .select('*')
+      .order('id', { ascending: false })
+      .eq('org_id', orgId);
+    if (table1Error) {
+      this.logger.error(
+        `Failed to fetch time rows for inputId=${orgId}`,
+        table1Error.message,
+      );
+      throw table1Error;
+    }
+    const attendanceRows = table1Data ?? [];
+    this.logger.log(
+      `Fetched ${attendanceRows.length} attendance rows from time for inputId=${orgId}`,
+    );
+    if (attendanceRows.length === 0) {
+      await this.logTimeRowsWhenEmpty(
+        `No attendance rows matched inputId=${orgId}, time.org_id=${orgId}`,
+      );
+    }
+
+    // Fetch data from the second table
+    const { data: table2Data, error: table2Error } = await this.supabase
+      .from('add_member')
+      .select('*')
+      .order('id', { ascending: false })
+      .eq('org_id', orgId);
+
+    if (table2Error) {
+      this.logger.error(
+        `Failed to fetch members for inputId=${orgId}`,
+        table2Error.message,
+      );
+      throw table2Error;
+    }
+    const memberRows = table2Data ?? [];
+    this.logger.log(
+      `Fetched ${memberRows.length} member rows from add_member for inputId=${orgId}`,
+    );
+
+    const membersByUserId = new Map(
+      memberRows.map((member) => [String(member.user_id), member]),
+    );
+
+    const joinedData = attendanceRows.map((attendance) => {
+      const userId = String(attendance.user_Id);
+      const member = membersByUserId.get(userId);
+
+      if (!member) {
+        this.logger.warn(
+          `No add_member match found for attendance id=${attendance.id}, user_Id=${attendance.user_Id}, inputId=${orgId}, attendanceOrgId=${attendance.org_id}`,
         );
-        // console.log(joinedData);
-        return joinedData;
+      }
+
+      return {
+        ...(member ?? {}),
+        ...attendance,
+        assign_group: member?.assign_group ?? attendance.assign_group ?? '',
+        group: member?.assign_group ?? attendance.group ?? '',
+        name:
+          member?.name ?? attendance.name ?? attendance.user_Id ?? 'Unknown',
+      };
+    });
+
+    this.logger.log(
+      `Returning ${joinedData.length} attendance rows for inputId=${orgId}`,
+    );
+    return joinedData;
+  }
+
+  async getTodaysPresentMembers(): Promise<any> {
+    const today = new Date().toISOString().split('T')[0];
+    this.logger.log(`getTodaysPresentMembers started date=${today}`);
+
+    const { data, error } = await this.supabase
+      .from('time')
+      .select('*')
+      .eq('date', today);
+    if (error) {
+      this.logger.error(
+        `Failed to fetch today's present members for date=${today}`,
+        error.message,
+      );
+      throw error;
     }
+    this.logger.log(
+      `Returning ${data?.length ?? 0} present member rows for date=${today}`,
+    );
+    return data;
+  }
 
-    async getTodaysPresentMembers(): Promise<any> {
-        const { data, error } = await this.supabase.from('time').select('*').eq('created_at', new Date().toISOString().split('T')[0]);
-        if (error) {
-            console.log(error);
-            throw error;
-        }
-        return data;
+  async getAttendanceWeeklyReport(orgId: any, body: any): Promise<any> {
+    await this.resolveOrganizationIds(orgId);
+    const endDate = new Date(body.date);
+    const startDate = new Date(endDate);
+    this.logger.log(
+      `getAttendanceWeeklyReport started inputId=${orgId}; filtering time.org_id=${orgId}, body=${JSON.stringify(body)}`,
+    );
+    if (body.range === 'week') {
+      startDate.setDate(startDate.getDate() - 6);
+    } else if (body.range === 'month') {
+      startDate.setMonth(startDate.getMonth() - 1);
     }
-
-    async getAttendanceWeeklyReport(orgId: any, body: any): Promise<any> {
-        const endDate = new Date(body.date);
-        const startDate = new Date(endDate);
-        console.log(orgId)
-        if(body.range === 'week'){
-            startDate.setDate(startDate.getDate() - 6);
-        }else if(body.range === 'month'){
-            startDate.setMonth(startDate.getMonth() - 1);
-        }
-        const datesArray = []
-        const tempDate = new Date(startDate);
-        while (tempDate <= endDate) {
-            datesArray.push(tempDate.toISOString().split('T')[0])
-            tempDate.setDate(tempDate.getDate() + 1);
-        }
-        // datesArray.push(tempDate.toISOString().split('T')[0]);
-        // console.log(datesArray);
-        // console.log(startDate);
-        // console.log(endDate);
-        const { data, error } = await this.supabase.from('time')
-            .select('*')
-            .eq('org_id', orgId)
-            .gte('date', startDate.toISOString().split('T')[0])
-            .lte('date', endDate.toISOString().split('T')[0])
-            .order('date', { ascending: false })
-        if (error) {
-            console.log(error);
-            throw error;
-        }
-        const groupedData = {};
-        for (let i = 0; i < data.length; i++) {
-
-            if (!groupedData[data[i].user_Id]) {
-                const { data: profileData } = await this.supabase.from('profile').select('*').eq('userId', data[i].user_Id)
-                // console.log(profileData);
-                const userData = {
-                    ...data[i], ...profileData[0]
-                }
-                groupedData[data[i].user_Id] = {
-                    user: userData
-                };
-
-                datesArray.forEach((date: any) => {
-                    groupedData[data[i].user_Id][date] = null;
-                })
-            }
-            groupedData[data[i].user_Id][data[i].date] = data[i]
-
-        }
-        // console.log("week data : ",groupedData);
-        return groupedData
+    const datesArray = [];
+    const tempDate = new Date(startDate);
+    while (tempDate <= endDate) {
+      datesArray.push(tempDate.toISOString().split('T')[0]);
+      tempDate.setDate(tempDate.getDate() + 1);
     }
-
-    async getAttendanceMonthlyReport(orgId: any, body: any): Promise<any> {
-        const endDate = new Date(body.date);
-        const startDate = new Date(endDate);
-        console.log(orgId)
-        startDate.setMonth(startDate.getMonth() - 1);
-        const datesArray = []
-        const tempDate = new Date(startDate);
-        while (tempDate <= endDate) {
-            datesArray.push(tempDate.toISOString().split('T')[0])
-            tempDate.setDate(tempDate.getDate() + 1);
-        }
-        // console.log(datesArray);
-        // console.log(startDate);
-        // console.log(endDate);
-        const { data, error } = await this.supabase.from('time')
-            .select('*')
-            .eq('org_id', orgId)
-            .gte('date', startDate.toISOString().split('T')[0])
-            .lte('date', endDate.toISOString().split('T')[0])
-            .order('date', { ascending: false })
-        if (error) {
-            console.log(error);
-            throw error;
-        }
-        const groupedData = {};
-        for (let i = 0; i < data.length; i++) {
-
-            if (!groupedData[data[i].user_Id]) {
-                const { data: profileData } = await this.supabase.from('profile').select('*').eq('userId', data[i].user_Id)
-                console.log(profileData);
-                const userData = {
-                    ...data[i], ...profileData[0]
-                }
-                groupedData[data[i].user_Id] = {
-                    user: userData
-                };
-
-                datesArray.forEach((date: any) => {
-                    groupedData[data[i].user_Id][date] = null;
-                })
-            }
-            groupedData[data[i].user_Id][data[i].date] = data[i]
-
-        }
-        // console.log(groupedData);
-        return groupedData
+    // datesArray.push(tempDate.toISOString().split('T')[0]);
+    // console.log(datesArray);
+    // console.log(startDate);
+    // console.log(endDate);
+    const { data, error } = await this.supabase
+      .from('time')
+      .select('*')
+      .eq('org_id', orgId)
+      .gte('date', startDate.toISOString().split('T')[0])
+      .lte('date', endDate.toISOString().split('T')[0])
+      .order('date', { ascending: false });
+    if (error) {
+      this.logger.error(
+        `Failed to fetch attendance report inputId=${orgId}, startDate=${startDate.toISOString().split('T')[0]}, endDate=${endDate.toISOString().split('T')[0]}`,
+        error.message,
+      );
+      throw error;
     }
-
-    async getOvertimeDailyReport(orgId: any, body: any): Promise<any> {
-        const { data, error } = await this.supabase.from('time').select('*').eq('org_id', orgId).eq('date', body.date);
-        if (error) {
-            console.log(error);
-            throw error;
-        }
-        console.log("before", data)
-        for(let i=0; i<data.length; i++){
-            const { data: profileData } = await this.supabase.from('profile').select('*').eq('userId', data[i].user_Id)
-            data[i] = {
-                ...data[i], ...profileData[0]
-            }
-        }
-        console.log("after",data)
-
-        return data;
+    this.logger.log(
+      `Fetched ${data?.length ?? 0} attendance report rows for inputId=${orgId}`,
+    );
+    if ((data?.length ?? 0) === 0) {
+      await this.logTimeRowsWhenEmpty(
+        `No attendance report rows matched inputId=${orgId}, time.org_id=${orgId}`,
+      );
     }
-
-    async getOvertimeReport(orgId: any, body: any): Promise<any> {
-        const endDate = new Date(body.date);
-        const startDate = new Date(endDate);
-        console.log(orgId)
-        if(body.range === 'week') startDate.setDate(startDate.getDate() - 6);
-        else if(body.range === 'month') startDate.setMonth(startDate.getMonth() - 1);
-        const datesArray = []
-        const tempDate = new Date(startDate);
-        while (tempDate <= endDate) {
-            datesArray.push(tempDate.toISOString().split('T')[0])
-            tempDate.setDate(tempDate.getDate() + 1);
+    const groupedData = {};
+    for (let i = 0; i < data.length; i++) {
+      if (!groupedData[data[i].user_Id]) {
+        const { data: profileData, error: profileError } = await this.supabase
+          .from('profile')
+          .select('*')
+          .eq('userId', data[i].user_Id);
+        if (profileError) {
+          this.logger.error(
+            `Failed to fetch profile for userId=${data[i].user_Id}`,
+            profileError.message,
+          );
+          throw profileError;
         }
-        // datesArray.push(tempDate.toISOString().split('T')[0]);
-        console.log(datesArray);
-        console.log(startDate);
-        console.log(endDate);
-        const { data, error } = await this.supabase.from('time')
-            .select('*')
-            .eq('org_id', orgId)
-            .gte('date', startDate.toISOString().split('T')[0])
-            .lte('date', endDate.toISOString().split('T')[0])
-            .order('date', { ascending: false })
-        if (error) {
-            console.log(error);
-            throw error;
+        if (!profileData?.length) {
+          this.logger.warn(`No profile found for userId=${data[i].user_Id}`);
         }
-        const groupedData = {};
-        for (let i = 0; i < data.length; i++) {
+        // console.log(profileData);
+        const userData = {
+          ...data[i],
+          ...(profileData?.[0] ?? {}),
+        };
+        groupedData[data[i].user_Id] = {
+          user: userData,
+        };
 
-            if (!groupedData[data[i].user_Id]) {
-                const { data: profileData } = await this.supabase.from('profile').select('*').eq('userId', data[i].user_Id)
-                console.log(profileData);
-                const userData = {
-                    ...data[i], ...profileData[0]
-                }
-                groupedData[data[i].user_Id] = {
-                    user: userData
-                };
-
-                datesArray.forEach((date: any) => {
-                    groupedData[data[i].user_Id][date] = null;
-                })
-            }
-            groupedData[data[i].user_Id][data[i].date] = data[i]
-
-        }
-        console.log(groupedData);
-        return groupedData
+        datesArray.forEach((date: any) => {
+          groupedData[data[i].user_Id][date] = null;
+        });
+      }
+      groupedData[data[i].user_Id][data[i].date] = data[i];
     }
+    this.logger.log(
+      `Returning attendance report for ${Object.keys(groupedData).length} users inputId=${orgId}`,
+    );
+    return groupedData;
+  }
+
+  async getAttendanceMonthlyReport(orgId: any, body: any): Promise<any> {
+    await this.resolveOrganizationIds(orgId);
+    const endDate = new Date(body.date);
+    const startDate = new Date(endDate);
+    this.logger.log(
+      `getAttendanceMonthlyReport started inputId=${orgId}; filtering time.org_id=${orgId}, body=${JSON.stringify(body)}`,
+    );
+    startDate.setMonth(startDate.getMonth() - 1);
+    const datesArray = [];
+    const tempDate = new Date(startDate);
+    while (tempDate <= endDate) {
+      datesArray.push(tempDate.toISOString().split('T')[0]);
+      tempDate.setDate(tempDate.getDate() + 1);
+    }
+    // console.log(datesArray);
+    // console.log(startDate);
+    // console.log(endDate);
+    const { data, error } = await this.supabase
+      .from('time')
+      .select('*')
+      .eq('org_id', orgId)
+      .gte('date', startDate.toISOString().split('T')[0])
+      .lte('date', endDate.toISOString().split('T')[0])
+      .order('date', { ascending: false });
+    if (error) {
+      this.logger.error(
+        `Failed to fetch monthly attendance report inputId=${orgId}, startDate=${startDate.toISOString().split('T')[0]}, endDate=${endDate.toISOString().split('T')[0]}`,
+        error.message,
+      );
+      throw error;
+    }
+    this.logger.log(
+      `Fetched ${data?.length ?? 0} monthly attendance rows for inputId=${orgId}`,
+    );
+    if ((data?.length ?? 0) === 0) {
+      await this.logTimeRowsWhenEmpty(
+        `No monthly attendance rows matched inputId=${orgId}, time.org_id=${orgId}`,
+      );
+    }
+    const groupedData = {};
+    for (let i = 0; i < data.length; i++) {
+      if (!groupedData[data[i].user_Id]) {
+        const { data: profileData, error: profileError } = await this.supabase
+          .from('profile')
+          .select('*')
+          .eq('userId', data[i].user_Id);
+        if (profileError) {
+          this.logger.error(
+            `Failed to fetch profile for userId=${data[i].user_Id}`,
+            profileError.message,
+          );
+          throw profileError;
+        }
+        if (!profileData?.length) {
+          this.logger.warn(`No profile found for userId=${data[i].user_Id}`);
+        }
+        const userData = {
+          ...data[i],
+          ...(profileData?.[0] ?? {}),
+        };
+        groupedData[data[i].user_Id] = {
+          user: userData,
+        };
+
+        datesArray.forEach((date: any) => {
+          groupedData[data[i].user_Id][date] = null;
+        });
+      }
+      groupedData[data[i].user_Id][data[i].date] = data[i];
+    }
+    this.logger.log(
+      `Returning monthly attendance report for ${Object.keys(groupedData).length} users inputId=${orgId}`,
+    );
+    return groupedData;
+  }
+
+  async getOvertimeDailyReport(orgId: any, body: any): Promise<any> {
+    await this.resolveOrganizationIds(orgId);
+    this.logger.log(
+      `getOvertimeDailyReport started inputId=${orgId}; filtering time.org_id=${orgId}, body=${JSON.stringify(body)}`,
+    );
+    const { data, error } = await this.supabase
+      .from('time')
+      .select('*')
+      .eq('org_id', orgId)
+      .eq('date', body.date);
+    if (error) {
+      this.logger.error(
+        `Failed to fetch overtime daily report inputId=${orgId}, date=${body.date}`,
+        error.message,
+      );
+      throw error;
+    }
+    this.logger.log(
+      `Fetched ${data?.length ?? 0} overtime daily rows for inputId=${orgId}, date=${body.date}`,
+    );
+    if ((data?.length ?? 0) === 0) {
+      await this.logTimeRowsWhenEmpty(
+        `No overtime daily rows matched inputId=${orgId}, time.org_id=${orgId}, date=${body.date}`,
+      );
+    }
+    for (let i = 0; i < data.length; i++) {
+      const { data: profileData, error: profileError } = await this.supabase
+        .from('profile')
+        .select('*')
+        .eq('userId', data[i].user_Id);
+      if (profileError) {
+        this.logger.error(
+          `Failed to fetch profile for userId=${data[i].user_Id}`,
+          profileError.message,
+        );
+        throw profileError;
+      }
+      if (!profileData?.length) {
+        this.logger.warn(`No profile found for userId=${data[i].user_Id}`);
+      }
+      data[i] = {
+        ...data[i],
+        ...(profileData?.[0] ?? {}),
+      };
+    }
+    this.logger.log(
+      `Returning ${data?.length ?? 0} overtime daily rows for inputId=${orgId}, date=${body.date}`,
+    );
+
+    return data;
+  }
+
+  async getOvertimeReport(orgId: any, body: any): Promise<any> {
+    await this.resolveOrganizationIds(orgId);
+    const endDate = new Date(body.date);
+    const startDate = new Date(endDate);
+    this.logger.log(
+      `getOvertimeReport started inputId=${orgId}; filtering time.org_id=${orgId}, body=${JSON.stringify(body)}`,
+    );
+    if (body.range === 'week') startDate.setDate(startDate.getDate() - 6);
+    else if (body.range === 'month')
+      startDate.setMonth(startDate.getMonth() - 1);
+    const datesArray = [];
+    const tempDate = new Date(startDate);
+    while (tempDate <= endDate) {
+      datesArray.push(tempDate.toISOString().split('T')[0]);
+      tempDate.setDate(tempDate.getDate() + 1);
+    }
+    const { data, error } = await this.supabase
+      .from('time')
+      .select('*')
+      .eq('org_id', orgId)
+      .gte('date', startDate.toISOString().split('T')[0])
+      .lte('date', endDate.toISOString().split('T')[0])
+      .order('date', { ascending: false });
+    if (error) {
+      this.logger.error(
+        `Failed to fetch overtime report inputId=${orgId}, startDate=${startDate.toISOString().split('T')[0]}, endDate=${endDate.toISOString().split('T')[0]}`,
+        error.message,
+      );
+      throw error;
+    }
+    this.logger.log(
+      `Fetched ${data?.length ?? 0} overtime report rows for inputId=${orgId}`,
+    );
+    if ((data?.length ?? 0) === 0) {
+      await this.logTimeRowsWhenEmpty(
+        `No overtime report rows matched inputId=${orgId}, time.org_id=${orgId}`,
+      );
+    }
+    const groupedData = {};
+    for (let i = 0; i < data.length; i++) {
+      if (!groupedData[data[i].user_Id]) {
+        const { data: profileData, error: profileError } = await this.supabase
+          .from('profile')
+          .select('*')
+          .eq('userId', data[i].user_Id);
+        if (profileError) {
+          this.logger.error(
+            `Failed to fetch profile for userId=${data[i].user_Id}`,
+            profileError.message,
+          );
+          throw profileError;
+        }
+        if (!profileData?.length) {
+          this.logger.warn(`No profile found for userId=${data[i].user_Id}`);
+        }
+        const userData = {
+          ...data[i],
+          ...(profileData?.[0] ?? {}),
+        };
+        groupedData[data[i].user_Id] = {
+          user: userData,
+        };
+
+        datesArray.forEach((date: any) => {
+          groupedData[data[i].user_Id][date] = null;
+        });
+      }
+      groupedData[data[i].user_Id][data[i].date] = data[i];
+    }
+    this.logger.log(
+      `Returning overtime report for ${Object.keys(groupedData).length} users inputId=${orgId}`,
+    );
+    return groupedData;
+  }
 }
-
