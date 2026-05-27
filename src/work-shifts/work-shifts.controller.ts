@@ -29,10 +29,10 @@ export class WorkShiftsController {
         }
     }
 
-    @Delete('/deleteWorkShift/:workShiftId')
+    @Delete('/deleteWorkShift/:workShiftId/:orgId')
     async deleteWorkShift(@Param() param: any): Promise<any> {
         try {
-            return await this.workShiftsService.deleteWorkShift(param.workShiftId);
+            return await this.workShiftsService.deleteWorkShift(param.workShiftId, param.orgId);
         } catch (error) {
             return {
                 success: false,

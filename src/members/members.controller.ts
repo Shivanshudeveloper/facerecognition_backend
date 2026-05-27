@@ -43,6 +43,16 @@ export class MembersController {
         await this.membersService.updateMember(param.id, body, file);
     }
 
+    @Get('/approveFaceSetup/:userId')
+    async approveFaceSetup(@Param() param: any): Promise<any> {
+        await this.membersService.approveFaceSetup(param.userId);
+    }
+
+    @Get('/rejectFaceSetup/:userId')
+    async rejectFaceSetup(@Param() param: any): Promise<any> {
+        await this.membersService.rejectFaceSetup(param.userId);
+    }
+
     @Get('/getShiftFromGroup/:group')
     async getShiftFromGroup(@Param() param: any): Promise<any> {
         return this.membersService.getShiftFromGroup(param.group);

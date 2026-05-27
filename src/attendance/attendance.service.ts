@@ -11,6 +11,64 @@ export class AttendanceService {
     this.configService.get<string>('SUPABASE_KEY'),
   );
 
+  private async fetchMemberMap(orgId: string): Promise<Map<string, any>> {
+    const { data: members, error } = await this.supabase
+      .from('add_member')
+      .select('user_id, name, member_image, group_id, email_id')
+      .eq('org_id', orgId);
+
+    if (error) {
+      this.logger.warn(`fetchMemberMap failed for orgId=${orgId}: ${error.message}`);
+      return new Map();
+    }
+
+    this.logger.log(`fetchMemberMap raw rows for orgId=${orgId}: ${JSON.stringify((members ?? []).map(m => ({ user_id: m.user_id, name: m.name, email_id: m.email_id })))}`);
+
+    const map = new Map<string, any>();
+    for (const m of members ?? []) {
+      if (m.user_id) map.set(String(m.user_id), m);
+    }
+    this.logger.log(`fetchMemberMap: loaded ${map.size} members with user_id for orgId=${orgId}, map keys=${JSON.stringify([...map.keys()])}`);
+    return map;
+  }
+
+  private async resolveName(userId: string, memberMap: Map<string, any>, orgId: string): Promise<{ name: string; member_image: string | null; assign_group: string | null }> {
+    const member = memberMap.get(String(userId));
+    if (member?.name) {
+      return { name: member.name, member_image: member.member_image ?? null, assign_group: member.group_id ?? null };
+    }
+
+    this.logger.warn(`resolveName: userId=${userId} not in memberMap (size=${memberMap.size}), trying auth+email fallback`);
+
+    // Fall back: look up via Supabase auth email → add_member.email_id
+    try {
+      const { data: authData, error: authError } = await this.supabase.auth.admin.getUserById(userId);
+      if (authError) this.logger.warn(`resolveName: auth.admin.getUserById error: ${authError.message}`);
+      const email = authData?.user?.email;
+      this.logger.warn(`resolveName: auth email for userId=${userId} → ${email ?? 'null'}`);
+      if (email) {
+        const { data: emailRows, error: emailError } = await this.supabase
+          .from('add_member')
+          .select('name, member_image, group_id')
+          .eq('email_id', email)
+          .eq('org_id', orgId)
+          .limit(1);
+        if (emailError) this.logger.warn(`resolveName: email lookup error: ${emailError.message}`);
+        const byEmail = emailRows?.[0] ?? null;
+        this.logger.warn(`resolveName: email lookup for ${email} → ${JSON.stringify(byEmail)}`);
+        if (byEmail?.name) {
+          memberMap.set(String(userId), byEmail);
+          return { name: byEmail.name, member_image: byEmail.member_image ?? null, assign_group: byEmail.group_id ?? null };
+        }
+      }
+    } catch (e) {
+      this.logger.warn(`resolveName: auth lookup threw for userId=${userId}: ${e}`);
+    }
+
+    this.logger.warn(`resolveName: FAILED to resolve name for userId=${userId}, orgId=${orgId} — returning raw userId`);
+    return { name: userId, member_image: null, assign_group: null };
+  }
+
   private async resolveOrganizationIds(inputId: any): Promise<string[]> {
     const requestedId = String(inputId);
     const { data, error } = await this.supabase
@@ -216,32 +274,18 @@ export class AttendanceService {
         `No attendance report rows matched inputId=${orgId}, time.org_id=${orgId}`,
       );
     }
+    const memberMap = await this.fetchMemberMap(String(orgId));
     const groupedData = {};
     for (let i = 0; i < data.length; i++) {
       if (!groupedData[data[i].user_Id]) {
-        const { data: profileData, error: profileError } = await this.supabase
-          .from('profile')
-          .select('*')
-          .eq('userId', data[i].user_Id);
-        if (profileError) {
-          this.logger.error(
-            `Failed to fetch profile for userId=${data[i].user_Id}`,
-            profileError.message,
-          );
-          throw profileError;
-        }
-        if (!profileData?.length) {
-          this.logger.warn(`No profile found for userId=${data[i].user_Id}`);
-        }
-        // console.log(profileData);
+        const resolved = await this.resolveName(data[i].user_Id, memberMap, String(orgId));
         const userData = {
           ...data[i],
-          ...(profileData?.[0] ?? {}),
+          group: resolved.assign_group ?? data[i].group ?? '',
+          name: resolved.name,
+          profile_image_url: resolved.member_image ?? null,
         };
-        groupedData[data[i].user_Id] = {
-          user: userData,
-        };
-
+        groupedData[data[i].user_Id] = { user: userData };
         datesArray.forEach((date: any) => {
           groupedData[data[i].user_Id][date] = null;
         });
@@ -293,31 +337,18 @@ export class AttendanceService {
         `No monthly attendance rows matched inputId=${orgId}, time.org_id=${orgId}`,
       );
     }
+    const memberMap = await this.fetchMemberMap(String(orgId));
     const groupedData = {};
     for (let i = 0; i < data.length; i++) {
       if (!groupedData[data[i].user_Id]) {
-        const { data: profileData, error: profileError } = await this.supabase
-          .from('profile')
-          .select('*')
-          .eq('userId', data[i].user_Id);
-        if (profileError) {
-          this.logger.error(
-            `Failed to fetch profile for userId=${data[i].user_Id}`,
-            profileError.message,
-          );
-          throw profileError;
-        }
-        if (!profileData?.length) {
-          this.logger.warn(`No profile found for userId=${data[i].user_Id}`);
-        }
+        const resolved = await this.resolveName(data[i].user_Id, memberMap, String(orgId));
         const userData = {
           ...data[i],
-          ...(profileData?.[0] ?? {}),
+          group: resolved.assign_group ?? data[i].group ?? '',
+          name: resolved.name,
+          profile_image_url: resolved.member_image ?? null,
         };
-        groupedData[data[i].user_Id] = {
-          user: userData,
-        };
-
+        groupedData[data[i].user_Id] = { user: userData };
         datesArray.forEach((date: any) => {
           groupedData[data[i].user_Id][date] = null;
         });
@@ -332,51 +363,42 @@ export class AttendanceService {
 
   async getOvertimeDailyReport(orgId: any, body: any): Promise<any> {
     await this.resolveOrganizationIds(orgId);
+    const dateStr = new Date(body.date).toISOString().split('T')[0];
     this.logger.log(
-      `getOvertimeDailyReport started inputId=${orgId}; filtering time.org_id=${orgId}, body=${JSON.stringify(body)}`,
+      `getOvertimeDailyReport started inputId=${orgId}; filtering time.org_id=${orgId}, date=${dateStr}`,
     );
     const { data, error } = await this.supabase
       .from('time')
       .select('*')
       .eq('org_id', orgId)
-      .eq('date', body.date);
+      .eq('date', dateStr);
     if (error) {
       this.logger.error(
-        `Failed to fetch overtime daily report inputId=${orgId}, date=${body.date}`,
+        `Failed to fetch overtime daily report inputId=${orgId}, date=${dateStr}`,
         error.message,
       );
       throw error;
     }
     this.logger.log(
-      `Fetched ${data?.length ?? 0} overtime daily rows for inputId=${orgId}, date=${body.date}`,
+      `Fetched ${data?.length ?? 0} overtime daily rows for inputId=${orgId}, date=${dateStr}`,
     );
     if ((data?.length ?? 0) === 0) {
       await this.logTimeRowsWhenEmpty(
-        `No overtime daily rows matched inputId=${orgId}, time.org_id=${orgId}, date=${body.date}`,
+        `No overtime daily rows matched inputId=${orgId}, time.org_id=${orgId}, date=${dateStr}`,
       );
     }
+    const memberMap = await this.fetchMemberMap(String(orgId));
     for (let i = 0; i < data.length; i++) {
-      const { data: profileData, error: profileError } = await this.supabase
-        .from('profile')
-        .select('*')
-        .eq('userId', data[i].user_Id);
-      if (profileError) {
-        this.logger.error(
-          `Failed to fetch profile for userId=${data[i].user_Id}`,
-          profileError.message,
-        );
-        throw profileError;
-      }
-      if (!profileData?.length) {
-        this.logger.warn(`No profile found for userId=${data[i].user_Id}`);
-      }
+      const resolved = await this.resolveName(data[i].user_Id, memberMap, String(orgId));
       data[i] = {
         ...data[i],
-        ...(profileData?.[0] ?? {}),
+        group: resolved.assign_group ?? data[i].group ?? '',
+        name: resolved.name,
+        profile_image_url: resolved.member_image ?? null,
       };
     }
     this.logger.log(
-      `Returning ${data?.length ?? 0} overtime daily rows for inputId=${orgId}, date=${body.date}`,
+      `Returning ${data?.length ?? 0} overtime daily rows for inputId=${orgId}, date=${dateStr}`,
     );
 
     return data;
@@ -420,31 +442,18 @@ export class AttendanceService {
         `No overtime report rows matched inputId=${orgId}, time.org_id=${orgId}`,
       );
     }
+    const memberMap = await this.fetchMemberMap(String(orgId));
     const groupedData = {};
     for (let i = 0; i < data.length; i++) {
       if (!groupedData[data[i].user_Id]) {
-        const { data: profileData, error: profileError } = await this.supabase
-          .from('profile')
-          .select('*')
-          .eq('userId', data[i].user_Id);
-        if (profileError) {
-          this.logger.error(
-            `Failed to fetch profile for userId=${data[i].user_Id}`,
-            profileError.message,
-          );
-          throw profileError;
-        }
-        if (!profileData?.length) {
-          this.logger.warn(`No profile found for userId=${data[i].user_Id}`);
-        }
+        const resolved = await this.resolveName(data[i].user_Id, memberMap, String(orgId));
         const userData = {
           ...data[i],
-          ...(profileData?.[0] ?? {}),
+          group: resolved.assign_group ?? data[i].group ?? '',
+          name: resolved.name,
+          profile_image_url: resolved.member_image ?? null,
         };
-        groupedData[data[i].user_Id] = {
-          user: userData,
-        };
-
+        groupedData[data[i].user_Id] = { user: userData };
         datesArray.forEach((date: any) => {
           groupedData[data[i].user_Id][date] = null;
         });

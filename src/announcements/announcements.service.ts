@@ -36,9 +36,8 @@ export class AnnouncementsService {
         const { data, error } = await this.supabase.from('add_announcements').update({
             title: body.title,
             description: body.description,
-            date: new Date(body.date).toLocaleDateString(),
+            date: new Date(body.date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
             attached_file: filePublicUrl || null,
-            group: body.groups,
         }).eq('id', id);
         if (error) {
             throw error;
@@ -47,25 +46,43 @@ export class AnnouncementsService {
     }
 
     async createAnnouncement(body: any, file: Express.Multer.File) {
-        // Handle file storage to Supabase storage
         let filePublicUrl = null;
         if (file) {
             filePublicUrl = await fileUpload(file, 'announcement_attachments');
         }
-        const { data, error } = await this.supabase.from('add_announcements').insert([
+        const { data: insertedRow, error } = await this.supabase.from('add_announcements').insert([
             {
                 title: body.title,
                 description: body.description,
-                date: new Date(body.date).toLocaleDateString(),
+                date: new Date(body.date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
                 attached_file: filePublicUrl || null,
-                group: body.groups,
                 org_id: body.user_id,
+                user_id: body.user_id,
             },
-        ]);
+        ]).select().single();
 
         if (error) {
             console.log(error);
             throw error;
+        }
+
+        // Store group associations in junction table if groups provided
+        if (body.groups && insertedRow?.id) {
+            const groupNames: string[] = body.groups.split(',').map((g: string) => g.trim()).filter(Boolean);
+            for (const groupName of groupNames) {
+                const { data: groupRow } = await this.supabase
+                    .from('drawer_groupAdd')
+                    .select('id')
+                    .eq('group_name', groupName)
+                    .eq('org_id', body.user_id)
+                    .single();
+                if (groupRow?.id) {
+                    await this.supabase.from('announcement_groups').insert({
+                        announcement_id: insertedRow.id,
+                        group_id: groupRow.id,
+                    });
+                }
+            }
         }
     }
 }

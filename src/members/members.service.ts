@@ -14,11 +14,42 @@ export class MembersService {
     private supabase = createClient(this.configService.get<string>('SUPABASE_URL'), this.configService.get<string>('SUPABASE_KEY'));
     async getAllMembers(orgId: any): Promise<any> {
         const { data, error } = await this.supabase.from('add_member').select('*').eq('org_id', orgId);
-        if (error) {
-            throw error;
-        }
-        // console.log(data);
-        return data;
+        if (error) throw error;
+
+        const { data: embeddings } = await this.supabase
+            .from('user_embeddings')
+            .select('user_id, status, created_at, image_url1, image_url2, image_url3, image_url4')
+            .eq('org_id', orgId)
+            .order('id', { ascending: false });
+
+        return (data || []).map(member => {
+            const embedding = (embeddings || []).find(e => e.user_id === member.user_id);
+            const faceImages = embedding
+                ? [embedding.image_url1, embedding.image_url2, embedding.image_url3, embedding.image_url4].filter(Boolean)
+                : [];
+            return {
+                ...member,
+                face_setup_status: embedding?.status || 'Pending',
+                face_setup_date: embedding?.created_at,
+                face_images: faceImages,
+            };
+        });
+    }
+
+    async approveFaceSetup(userId: any): Promise<any> {
+        const { error } = await this.supabase
+            .from('user_embeddings')
+            .update({ status: 'Approved' })
+            .eq('user_id', userId);
+        if (error) throw error;
+    }
+
+    async rejectFaceSetup(userId: any): Promise<any> {
+        const { error } = await this.supabase
+            .from('user_embeddings')
+            .update({ status: 'Rejected' })
+            .eq('user_id', userId);
+        if (error) throw error;
     }
 
     async addMember(body: any, file: Express.Multer.File): Promise<any> {
@@ -34,10 +65,10 @@ export class MembersService {
                     mob_num: body.mob_num,
                     email_id: body.email_id,
                     onboard_status: body.onboard_status,
-                    assign_group: body.assign_group,
+                    group_id: (body.group_id === 'null' || body.group_id === '') ? null : body.group_id,
                     member_image: publicUrl,
                     org_id: body.user_id,
-                    user_id:body.member_id
+                    user_id: body.member_id
                 },
             ]);
         if (error) {
@@ -45,10 +76,13 @@ export class MembersService {
         }
         // updating total member count in group
         try {
-            if(body.assign_group){
-                const groupService = new GroupsService(this.configService)
-                const oldGroup = await groupService.getGroupByGroupNameAndOrgId(body.assign_group, body.user_id)
-                await groupService.updateGroup(oldGroup[0]?.id, { total_member: (parseInt(oldGroup[0].total_member) + 1).toString() })
+            if (body.group_id) {
+                const { data: groupData } = await this.supabase
+                    .from('drawer_groupAdd').select('*').eq('id', body.group_id).single();
+                if (groupData) {
+                    const groupService = new GroupsService(this.configService);
+                    await groupService.updateGroup(body.group_id, { total_member: (parseInt(groupData.total_member) + 1).toString() });
+                }
             }
         }
         catch (e) {
@@ -66,13 +100,17 @@ export class MembersService {
 
         // updating total member count in group
         try {
-            const groupService = new GroupsService(this.configService)
-            const oldGroup = await groupService.getGroupByGroupNameAndOrgId(tempMember[0].assign_group, tempMember[0].org_id)
-            await groupService.updateGroup(oldGroup[0].id, { total_member: (parseInt(oldGroup[0].total_member) - 1).toString() })
+            if (tempMember?.[0]?.group_id) {
+                const { data: groupData } = await this.supabase
+                    .from('drawer_groupAdd').select('*').eq('id', tempMember[0].group_id).single();
+                if (groupData) {
+                    const groupService = new GroupsService(this.configService);
+                    await groupService.updateGroup(tempMember[0].group_id, { total_member: (parseInt(groupData.total_member) - 1).toString() });
+                }
+            }
         }
         catch (e) {
             console.log(e);
-            throw new Error(e);
         }
     }
 
@@ -81,10 +119,10 @@ export class MembersService {
         if (error) {
             throw error;
         }
-        if (data) {
-            console.log(data);
-            await sendEmail(body.email_id, "test", `Hi ${data[0].name}`);
+        if (!data || data.length === 0) {
+            throw new Error('Member not found');
         }
+        await sendEmail(body.email_id, "test", `Hi ${data[0].name}`);
     }
 
     async sendSMS(body: any): Promise<any> {
@@ -105,9 +143,15 @@ export class MembersService {
     }
 
     async updateMember(id: any, body: any, file: Express.Multer.File): Promise<any> {
-        let updatedRecord = {
-            ...body
-        }
+        let updatedRecord = { ...body };
+
+        // multipart/form-data sends null as the string "null" — convert to actual null
+        Object.keys(updatedRecord).forEach(key => {
+            if (updatedRecord[key] === 'null' || updatedRecord[key] === '') {
+                updatedRecord[key] = null;
+            }
+        });
+
         if (file) {
             const publicUrl = await fileUpload(file, 'member_image');
             updatedRecord = {
@@ -125,16 +169,21 @@ export class MembersService {
         }
 
         try {
-            const groupService = new GroupsService(this.configService)
-            const oldGroup = await groupService.getGroupByGroupNameAndOrgId(tempMember[0].assign_group, tempMember[0].org_id)
-            if(oldGroup[0]){
-                await groupService.updateGroup(oldGroup[0].id, { total_member: (parseInt(oldGroup[0].total_member) - 1).toString() })
+            const groupService = new GroupsService(this.configService);
+            if (tempMember[0].group_id) {
+                const { data: oldGroupData } = await this.supabase
+                    .from('drawer_groupAdd').select('*').eq('id', tempMember[0].group_id).single();
+                if (oldGroupData) {
+                    await groupService.updateGroup(tempMember[0].group_id, { total_member: (parseInt(oldGroupData.total_member) - 1).toString() });
+                }
             }
-            const newGroup = await groupService.getGroupByGroupNameAndOrgId(body.assign_group, tempMember[0].org_id)
-            if(newGroup[0]){
-                await groupService.updateGroup(newGroup[0].id, { total_member: (parseInt(newGroup[0].total_member) + 1).toString() })
+            if (body.group_id) {
+                const { data: newGroupData } = await this.supabase
+                    .from('drawer_groupAdd').select('*').eq('id', body.group_id).single();
+                if (newGroupData) {
+                    await groupService.updateGroup(body.group_id, { total_member: (parseInt(newGroupData.total_member) + 1).toString() });
+                }
             }
-            // await groupService.updateGroup(newGroup[0].id, { total_member: (parseInt(newGroup[0].total_member) + 1).toString() })
         }
         catch (e) {
             console.log(e);

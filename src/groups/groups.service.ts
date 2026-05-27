@@ -13,7 +13,13 @@ export class GroupsService {
         return data;
     }
     async createGroup(body: any): Promise<any> {
-        const { data, error } = await this.supabase.from('drawer_groupAdd').insert([body]);
+        const { data, error } = await this.supabase.from('drawer_groupAdd').insert([{
+            group_name: body.group_name,
+            total_member: String(body.total_member ?? 0),
+            user_id: body.org_id,
+            org_id: body.org_id,
+            shift_id: body.shift_id ? Number(body.shift_id) : null,
+        }]);
         if (error) {
             throw error;
         }
